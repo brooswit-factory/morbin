@@ -46,7 +46,7 @@ test("lazy reads fetch once while fresh and TTL itself never fetches", async () 
 test("resource watches snapshot before pushed changes and pushed data refreshes cache", async () => {
   const api = fakeProvider();
   const events = [];
-  const morbin = createMorbin({ providers: { api }, random: () => 0 });
+  const morbin = createMorbin({ providers: { api }, now: () => 42, random: () => 0 });
   morbin.watchResource("api", "a", (event) => events.push(event));
   await flush();
   api.values.set("a", { id: "a", version: 2 });
@@ -54,8 +54,8 @@ test("resource watches snapshot before pushed changes and pushed data refreshes 
   assert.deepEqual(events.map((event) => event.kind), ["snapshot", "change"]);
   assert.equal(morbin.cacheEntry("api", "a").source, "push");
   assert.deepEqual(events.map(({ contractVersion, kind, subject, operation, sequence, cursor, meta }) => ({ contractVersion, kind, subject, operation, sequence, cursor, meta })), [
-    { contractVersion: "1.0", kind: "snapshot", subject: { kind: "resource", key: canonicalResourceId("api", "a") }, operation: undefined, sequence: 1, cursor: null, meta: { emittedAt: events[0].meta.emittedAt, source: "pull" } },
-    { contractVersion: "1.0", kind: "change", subject: { kind: "resource", key: canonicalResourceId("api", "a") }, operation: "upsert", sequence: 2, cursor: "1", meta: { emittedAt: events[1].meta.emittedAt, source: "push" } },
+    { contractVersion: "1.0", kind: "snapshot", subject: { kind: "resource", key: canonicalResourceId("api", "a") }, operation: undefined, sequence: 1, cursor: null, meta: { emittedAt: "1970-01-01T00:00:00.042Z", source: "provider" } },
+    { contractVersion: "1.0", kind: "change", subject: { kind: "resource", key: canonicalResourceId("api", "a") }, operation: "upsert", sequence: 2, cursor: "1", meta: { emittedAt: "1970-01-01T00:00:00.042Z", source: "provider" } },
   ]);
 });
 
@@ -166,7 +166,7 @@ test("a provider-reported expired cursor resets and snapshots only after authori
   assert.deepEqual(events.at(-2), {
     contractVersion: "1.0", kind: "reset", subscriptionId: subscription.id, streamEpoch: 2, sequence: 1,
     cursor: null, subject: { kind: "resource", key: canonicalResourceId("api", "a") }, data: null,
-    meta: { emittedAt: 42, source: "replay" }, operation: "reset",
+    meta: { emittedAt: "1970-01-01T00:00:00.042Z", source: "provider" }, operation: "reset",
   });
   assert.equal(events.at(-1).streamEpoch, 2);
 });
@@ -201,6 +201,31 @@ test("a transient provider failure remains recoverable through subscribed pollin
   assert.equal(attempts, 2);
 });
 
+test("both query modes recover an initial query failure with their first complete snapshot", async () => {
+  let clock = 0;
+  const api = fakeProvider();
+  let attempts = 0;
+  const query = api.query;
+  api.query = async (...args) => {
+    attempts += 1;
+    if (attempts <= 2) throw new Error("temporary query failure");
+    return query(...args);
+  };
+  const membership = [];
+  const content = [];
+  const morbin = createMorbin({ providers: { api }, now: () => clock, random: () => 0, freshness: { pull: [10, 10] } });
+  morbin.watchQuery("api", { all: true }, "membership", (event) => membership.push(event));
+  morbin.watchQuery("api", { all: true }, "content", (event) => content.push(event));
+  await flush();
+  assert.deepEqual(membership.map((event) => event.kind), ["error"]);
+  assert.deepEqual(content.map((event) => event.kind), ["error"]);
+  clock = 11;
+  await morbin.poll();
+  assert.deepEqual(membership.map((event) => event.kind), ["error", "snapshot"]);
+  assert.deepEqual(content.map((event) => event.kind), ["error", "snapshot"]);
+  assert.equal(attempts, 3, "the fallback query is coalesced for both modes");
+});
+
 test("polling only refreshes stale subscribed resources and freshness ranges are ordered", async () => {
   let clock = 0;
   const api = fakeProvider();
@@ -229,8 +254,8 @@ test("poll coalesces stale resource fetches and fans the result to every watcher
   clock = 11;
   await morbin.poll();
   assert.equal(api.fetches, before + 1);
-  assert.equal(first.at(-1).meta.source, "poll");
-  assert.equal(second.at(-1).meta.source, "poll");
+  assert.equal(first.at(-1).meta.source, "provider");
+  assert.equal(second.at(-1).meta.source, "provider");
 });
 
 test("poll recovers stale active query watches with one fetch and ignores inactive queries", async () => {

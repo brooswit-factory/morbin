@@ -111,6 +111,10 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
       : canonicalQueryId(watch.provider, watch.query);
   }
 
+  function contractSource(source) {
+    return source === "morbr" ? "morbr" : source === "local" ? "local" : "provider";
+  }
+
   function emit(watch, event) {
     if (watch.closed) return;
     if (!watch.ready && event.kind === "change") {
@@ -126,7 +130,7 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
       cursor: event.cursor ?? null,
       subject: { kind: watch.kind, key: subjectFor(watch) },
       data: event.data,
-      meta: { emittedAt: now(), source: event.source ?? "local" },
+      meta: { emittedAt: new Date(now()).toISOString(), source: contractSource(event.source ?? "local") },
       ...(event.operation ? { operation: event.operation } : {}),
       ...(event.error ? { error: event.error } : {}),
     });
@@ -330,7 +334,15 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
         const provider = providerFor(first.provider);
         if (typeof provider.query !== "function") throw new TypeError(`Provider ${first.provider} does not implement query`);
         const items = await provider.query(first.query);
-        for (const watch of group) updateQueryWatch(watch, items, "pull");
+        for (const watch of group) {
+          if (!watch.initialized) {
+            applyQuery(watch, items, { initial: true, source: "pull" });
+            watch.initialized = true;
+            ready(watch);
+          } else {
+            updateQueryWatch(watch, items, "pull");
+          }
+        }
       } catch (error) { for (const watch of group) failWatch(watch, error); }
     }
   }
