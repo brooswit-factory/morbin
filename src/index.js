@@ -52,6 +52,10 @@ function normalizeError(error) {
   return error instanceof Error ? error : new Error(String(error));
 }
 
+function isCursorGap(error) {
+  return error?.code === "CURSOR_EXPIRED" || error?.code === "CURSOR_UNAVAILABLE" || error?.code === "CURSOR_GAP";
+}
+
 function itemId(value) {
   if (value && typeof value === "object" && value.id !== undefined) return String(value.id);
   return stable(value);
@@ -109,18 +113,22 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
 
   function emit(watch, event) {
     if (watch.closed) return;
-    if (!watch.ready && event.type === "change") {
+    if (!watch.ready && event.kind === "change") {
       watch.pending.push(event);
       return;
     }
     watch.listener({
-      version: 1,
+      contractVersion: "1.0",
+      kind: event.kind,
       subscriptionId: watch.id,
-      epoch: watch.epoch,
+      streamEpoch: watch.epoch,
       sequence: ++watch.sequence,
-      subject: subjectFor(watch),
-      operation: event.type,
-      ...event,
+      cursor: event.cursor ?? null,
+      subject: { kind: watch.kind, key: subjectFor(watch) },
+      data: event.data,
+      meta: { emittedAt: now(), source: event.source ?? "local" },
+      ...(event.operation ? { operation: event.operation } : {}),
+      ...(event.error ? { error: event.error } : {}),
     });
   }
 
@@ -131,7 +139,7 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
 
   async function emitResourceSnapshot(watch) {
     const value = await read(watch.provider, watch.resource);
-    emit(watch, { type: "snapshot", resource: watch.resource, value });
+    emit(watch, { kind: "snapshot", data: value, source: "pull" });
   }
 
   function setQueryExpiry(watch, source = "pull") {
@@ -141,7 +149,7 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
   function applyQuery(watch, items, { initial = false, source = "pull" } = {}) {
     watch.items = new Map(items.map((value) => [itemId(value), value]));
     setQueryExpiry(watch, source);
-    if (initial) emit(watch, { type: "snapshot", query: watch.query, mode: watch.mode, value: items });
+    if (initial) emit(watch, { kind: "snapshot", data: items, source });
   }
 
   async function querySnapshot(watch) {
@@ -168,9 +176,18 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
         if (watch.kind === "resource") await emitResourceSnapshot(watch);
         else await querySnapshot(watch);
       }
+      if (snapshot) watch.initialized = true;
       ready(watch);
     } catch (error) {
-      failWatch(watch, error);
+      if (watch.reconnecting && isCursorGap(error)) {
+        watch.cursor = undefined;
+        watch.cursors.clear();
+        watch.reconnecting = false;
+        emit(watch, { kind: "reset", operation: "reset", data: null, source: "replay" });
+        await startWatch(watch, { snapshot: true });
+      } else {
+        failWatch(watch, error);
+      }
     }
   }
 
@@ -184,13 +201,13 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
   function failWatch(watch, cause) {
     const error = normalizeError(cause);
     // Authorization failures terminate without emitting cached/protected data.
-    emit(watch, { type: "error", error });
+    emit(watch, { kind: "error", data: null, error, source: "provider" });
     if (error.retryable === false) closeWatch(watch);
-    else ready(watch);
+    else if (watch.initialized) ready(watch);
   }
 
   function watchResource(provider, resource, listener) {
-    const watch = { id: `sub-${nextSubscription++}`, epoch: 1, sequence: 0, kind: "resource", provider, resource, listener, cursors: new Set(), pending: [], ready: false, closed: false };
+    const watch = { id: `sub-${nextSubscription++}`, epoch: 1, sequence: 0, kind: "resource", provider, resource, listener, cursors: new Set(), pending: [], ready: false, initialized: false, closed: false };
     watches.set(watch.id, watch);
     void startWatch(watch);
     return { id: watch.id, close: () => closeWatch(watch) };
@@ -198,7 +215,7 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
 
   function watchQuery(provider, query, mode, listener) {
     if (!new Set(["membership", "content"]).has(mode)) throw new TypeError("query watch mode must be membership or content");
-    const watch = { id: `sub-${nextSubscription++}`, epoch: 1, sequence: 0, kind: "query", provider, query, mode, listener, items: new Map(), queryExpiresAt: 0, cursors: new Set(), pending: [], ready: false, closed: false };
+    const watch = { id: `sub-${nextSubscription++}`, epoch: 1, sequence: 0, kind: "query", provider, query, mode, listener, items: new Map(), queryExpiresAt: 0, cursors: new Set(), pending: [], ready: false, initialized: false, closed: false };
     watches.set(watch.id, watch);
     void startWatch(watch);
     return { id: watch.id, close: () => closeWatch(watch) };
@@ -212,10 +229,10 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
     watch.items = next;
     setQueryExpiry(watch, source);
     if (watch.mode === "membership" && (added.length || removed.length)) {
-      emit(watch, { type: "change", query: watch.query, mode: watch.mode, added, removed });
+      emit(watch, { kind: "change", operation: "upsert", data: { added, removed }, source });
     }
     if (watch.mode === "content" && (added.length || removed.length || changed.length)) {
-      emit(watch, { type: "change", query: watch.query, mode: watch.mode, added, removed, changed, value: nextItems });
+      emit(watch, { kind: "change", operation: "upsert", data: nextItems, source });
     }
   }
 
@@ -227,7 +244,6 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
     if (cursor != null && matchingResources.length && !hasQueryWatch && matchingResources.every((watch) => watch.cursors.has(cursor))) {
       return false;
     }
-    if (value !== undefined) store(provider, resource, value, source === "push" ? "push" : "upstream");
     let delivered = false;
     const queries = new Map();
     for (const watch of affected) {
@@ -237,7 +253,7 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
           watch.cursors.add(cursor);
           watch.cursor = cursor;
         }
-        emit(watch, { type: "change", resource, value, cursor });
+        emit(watch, { kind: "change", operation: "upsert", data: value, cursor, source });
         delivered = true;
       } else if (watch.kind === "query") {
         const key = canonicalQueryId(watch.provider, watch.query);
@@ -254,6 +270,7 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
         delivered = true;
       }
     }
+    if (value !== undefined && (delivered || affected.length === 0)) store(provider, resource, value, source === "push" ? "push" : "upstream");
     return delivered;
   }
 
@@ -267,8 +284,9 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
     watch.epoch += 1;
     watch.sequence = 0;
     watch.ready = false;
+    watch.reconnecting = cursorAvailable;
     if (!cursorAvailable) {
-      emit(watch, { type: "reset", reason: "cursor-unavailable" });
+      emit(watch, { kind: "reset", operation: "reset", data: null, source: "replay" });
     }
     await startWatch(watch, { snapshot: !cursorAvailable });
     return true;
@@ -294,7 +312,15 @@ export function createMorbin({ providers = {}, freshness = {}, now = () => Date.
       if (fresh(cache.get(cacheKey(first.provider, first.resource)))) continue;
       try {
         const value = await read(first.provider, first.resource, { force: true });
-        for (const watch of group) emit(watch, { type: "change", resource: watch.resource, value, source: "poll" });
+        for (const watch of group) {
+          if (!watch.initialized) {
+            emit(watch, { kind: "snapshot", data: value, source: "poll" });
+            watch.initialized = true;
+            ready(watch);
+          } else {
+            emit(watch, { kind: "change", operation: "upsert", data: value, source: "poll" });
+          }
+        }
       } catch (error) { for (const watch of group) failWatch(watch, error); }
     }
     for (const group of queries.values()) {

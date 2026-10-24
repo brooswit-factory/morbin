@@ -51,11 +51,11 @@ test("resource watches snapshot before pushed changes and pushed data refreshes 
   await flush();
   api.values.set("a", { id: "a", version: 2 });
   await api.push({ resource: "a", value: { id: "a", version: 2 }, cursor: "1", source: "push" });
-  assert.deepEqual(events.map((event) => event.type), ["snapshot", "change"]);
+  assert.deepEqual(events.map((event) => event.kind), ["snapshot", "change"]);
   assert.equal(morbin.cacheEntry("api", "a").source, "push");
-  assert.deepEqual(events.map(({ version, subject, operation, sequence }) => ({ version, subject, operation, sequence })), [
-    { version: 1, subject: canonicalResourceId("api", "a"), operation: "snapshot", sequence: 1 },
-    { version: 1, subject: canonicalResourceId("api", "a"), operation: "change", sequence: 2 },
+  assert.deepEqual(events.map(({ contractVersion, kind, subject, operation, sequence, cursor, meta }) => ({ contractVersion, kind, subject, operation, sequence, cursor, meta })), [
+    { contractVersion: "1.0", kind: "snapshot", subject: { kind: "resource", key: canonicalResourceId("api", "a") }, operation: undefined, sequence: 1, cursor: null, meta: { emittedAt: events[0].meta.emittedAt, source: "pull" } },
+    { contractVersion: "1.0", kind: "change", subject: { kind: "resource", key: canonicalResourceId("api", "a") }, operation: "upsert", sequence: 2, cursor: "1", meta: { emittedAt: events[1].meta.emittedAt, source: "push" } },
   ]);
 });
 
@@ -69,12 +69,12 @@ test("query membership and content watches distinguish their changes", async () 
   await flush();
   api.values.set("a", { id: "a", version: 2 });
   await api.push({ resource: "a", value: { id: "a", version: 2 }, cursor: "2" });
-  assert.deepEqual(membership.map((event) => event.type), ["snapshot"]);
-  assert.deepEqual(content.map((event) => event.type), ["snapshot", "change"]);
+  assert.deepEqual(membership.map((event) => event.kind), ["snapshot"]);
+  assert.deepEqual(content.map((event) => event.kind), ["snapshot", "change"]);
   api.values.set("c", { id: "c", version: 1 });
   await api.push({ resource: "c", value: { id: "c", version: 1 }, cursor: "3" });
-  assert.equal(membership.at(-1).type, "change");
-  assert.deepEqual(membership.at(-1).added, ["c"]);
+  assert.equal(membership.at(-1).kind, "change");
+  assert.deepEqual(membership.at(-1).data.added, ["c"]);
 });
 
 test("replay de-duplicates immutable cursors and recovery is reset then snapshot", async () => {
@@ -86,8 +86,8 @@ test("replay de-duplicates immutable cursors and recovery is reset then snapshot
   assert.equal(await morbin.receive({ provider: "api", resource: "a", value: { id: "a", version: 2 }, cursor: "cursor-1" }), true);
   assert.equal(await morbin.receive({ provider: "api", resource: "a", value: { id: "a", version: 3 }, cursor: "cursor-1" }), false);
   await morbin.reconnect(subscription.id, { cursorAvailable: false });
-  assert.deepEqual(events.map((event) => event.type), ["snapshot", "change", "reset", "snapshot"]);
-  assert.equal(events.at(-1).epoch, 2);
+  assert.deepEqual(events.map((event) => event.kind), ["snapshot", "change", "reset", "snapshot"]);
+  assert.equal(events.at(-1).streamEpoch, 2);
 });
 
 test("reconnect authorizes its stream before emitting a cached protected snapshot", async () => {
@@ -104,7 +104,7 @@ test("reconnect authorizes its stream before emitting a cached protected snapsho
   await flush();
   revoked = true;
   await morbin.reconnect(subscription.id);
-  assert.deepEqual(events.map((event) => event.type), ["snapshot", "error"]);
+  assert.deepEqual(events.map((event) => event.kind), ["snapshot", "error"]);
   assert.equal(events.at(-1).error.code, "FORBIDDEN");
 });
 
@@ -129,7 +129,46 @@ test("reconnect carries a logical watch cursor, de-duplicates replay, and permit
   assert.equal(morbin.cacheEntry("api", "a").value.version, 3, "a duplicate replay cannot roll cache state backward");
   assert.equal(await morbin.receive({ provider: "api", resource: "a", value: { id: "a", version: 4 }, cursor: null }), true);
   assert.equal(await morbin.receive({ provider: "api", resource: "a", value: { id: "a", version: 5 }, cursor: null }), true);
-  assert.deepEqual(events.map((event) => event.type), ["snapshot", "change", "change", "change", "change"]);
+  assert.deepEqual(events.map((event) => event.kind), ["snapshot", "change", "change", "change", "change"]);
+});
+
+test("a replay duplicate cannot roll cache state back when resource and query watches coexist", async () => {
+  const api = fakeProvider();
+  const morbin = createMorbin({ providers: { api } });
+  morbin.watchResource("api", "a", () => {});
+  morbin.watchQuery("api", { all: true }, "content", () => {});
+  await flush();
+  await morbin.receive({ provider: "api", resource: "a", value: { id: "a", version: 2 }, cursor: "c12" });
+  await morbin.receive({ provider: "api", resource: "a", value: { id: "a", version: 3 }, cursor: "c13" });
+  assert.equal(await morbin.receive({ provider: "api", resource: "a", value: { id: "a", version: 2 }, cursor: "c12" }), false);
+  assert.equal(morbin.cacheEntry("api", "a").value.version, 3);
+});
+
+test("a provider-reported expired cursor resets and snapshots only after authorized replacement", async () => {
+  const api = fakeProvider();
+  const subscribe = api.subscribe;
+  let expireNextReconnect = false;
+  api.subscribe = async (request) => {
+    if (expireNextReconnect && request.cursor === "c12") {
+      expireNextReconnect = false;
+      throw { code: "CURSOR_EXPIRED" };
+    }
+    return subscribe(request);
+  };
+  const events = [];
+  const morbin = createMorbin({ providers: { api }, now: () => 42 });
+  const subscription = morbin.watchResource("api", "a", (event) => events.push(event));
+  await flush();
+  await morbin.receive({ provider: "api", resource: "a", value: { id: "a", version: 2 }, cursor: "c12" });
+  expireNextReconnect = true;
+  await morbin.reconnect(subscription.id);
+  assert.deepEqual(events.map((event) => event.kind), ["snapshot", "change", "reset", "snapshot"]);
+  assert.deepEqual(events.at(-2), {
+    contractVersion: "1.0", kind: "reset", subscriptionId: subscription.id, streamEpoch: 2, sequence: 1,
+    cursor: null, subject: { kind: "resource", key: canonicalResourceId("api", "a") }, data: null,
+    meta: { emittedAt: 42, source: "replay" }, operation: "reset",
+  });
+  assert.equal(events.at(-1).streamEpoch, 2);
 });
 
 test("unauthorized reconnect terminates without a protected replacement snapshot", async () => {
@@ -139,7 +178,7 @@ test("unauthorized reconnect terminates without a protected replacement snapshot
   const subscription = morbin.watchResource("api", "a", (event) => events.push(event));
   await flush();
   await morbin.reconnect(subscription.id, { error: { status: 401 } });
-  assert.deepEqual(events.map((event) => event.type), ["snapshot", "error"]);
+  assert.deepEqual(events.map((event) => event.kind), ["snapshot", "error"]);
   assert.equal(events.at(-1).error.code, "UNAUTHORIZED");
   assert.equal(events.at(-1).error.retryable, false);
 });
@@ -156,9 +195,9 @@ test("a transient provider failure remains recoverable through subscribed pollin
   const morbin = createMorbin({ providers: { api } });
   morbin.watchResource("api", "a", (event) => events.push(event));
   await flush();
-  assert.deepEqual(events.map((event) => event.type), ["error"]);
+  assert.deepEqual(events.map((event) => event.kind), ["error"]);
   await morbin.poll();
-  assert.deepEqual(events.map((event) => event.type), ["error", "change"]);
+  assert.deepEqual(events.map((event) => event.kind), ["error", "snapshot"]);
   assert.equal(attempts, 2);
 });
 
@@ -190,8 +229,8 @@ test("poll coalesces stale resource fetches and fans the result to every watcher
   clock = 11;
   await morbin.poll();
   assert.equal(api.fetches, before + 1);
-  assert.equal(first.at(-1).source, "poll");
-  assert.equal(second.at(-1).source, "poll");
+  assert.equal(first.at(-1).meta.source, "poll");
+  assert.equal(second.at(-1).meta.source, "poll");
 });
 
 test("poll recovers stale active query watches with one fetch and ignores inactive queries", async () => {
@@ -211,8 +250,8 @@ test("poll recovers stale active query watches with one fetch and ignores inacti
   clock = 11;
   await morbin.poll();
   assert.equal(queries, before + 1, "matching active query watches share one fallback fetch");
-  assert.equal(membership.at(-1).type, "change");
-  assert.equal(content.at(-1).type, "change");
+  assert.equal(membership.at(-1).kind, "change");
+  assert.equal(content.at(-1).kind, "change");
   first.close();
   second.close();
   clock = 30;
