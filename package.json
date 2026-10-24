@@ -1,0 +1,14 @@
+{
+  "name": "@brooswit-factory/morbin",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "exports": "./src/index.js",
+  "scripts": {
+    "build": "node --check src/index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
